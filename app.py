@@ -51,8 +51,19 @@ def draw_label(image, point, label, font=cv2.FONT_HERSHEY_SIMPLEX,
 
 
 def draw_boxes_and_label(image, label, box, color=(255, 255, 0)):
-    box = [int(n) for n in box]
-    x1, y1, x2, y2 = tuple(box)
+    """
+    Modify an image by inserting a labeled bounding box.
+
+    Args:
+        image: The original image as a numpy ndarray
+        label: Text label string to apply to the box
+        box: list of integers (x1, y1, x2, y2) that describe the
+             coordinates of the upper left corner and the width
+             and height of the box
+        color: Tuple of RGB values to use as the color of the box
+    Returns the original image, with the indicated box drawn
+    """
+    x1, y1, x2, y2 = (int(c) for c in box)
     p1 = (x1, y1)
     p2 = (x1 + x2, y1 + y2)
     cv2.rectangle(image, p1, p2, color, 2, 1)
@@ -109,7 +120,7 @@ def video_feed():
 
 
 def gen():
-    TARGET_FPS = 10.0
+    TARGET_FPS = 20.0
     FRAME_TIME_INTERVAL = 1.0 / TARGET_FPS
     IMAGE_RESOLUTION = 1024
 
@@ -126,6 +137,9 @@ def gen():
     # List of images captured since the last time an image was submitted to
     # the expensive backend model.
     images_since_submit = []
+
+    # Bounding boxes of faces in the most recent frame
+    bounding_boxes = []
 
     while True:
         start = time.time()
@@ -151,7 +165,7 @@ def gen():
             # Play back the video that has happened since the image was
             # submitted for inference, updating the bounding boxes as we go
             for img in images_since_submit:
-                tracker.update(img)
+                _, _ = tracker.update(img)
 
             # Use a different color to indicate updated bounding box
             color = (0, 0, 255)
@@ -162,6 +176,7 @@ def gen():
         if future is None or future.done():
             future = executor.submit(predict_age_local, img_np_frame)
             last_inference_image = img_np_frame
+            last_inference_image_bounding_boxes = bounding_boxes
             images_since_submit.clear()
         else:
             images_since_submit.append(img_np_frame)
@@ -183,7 +198,9 @@ def gen():
 
         actual_loop_time = time.time() - start
         frames_per_second = 1.0 / actual_loop_time
-        print("FPS: " + str(frames_per_second))
+        print("Processing time {:4.3f} sec; FPS {:4.2f}"
+              "".format(loop_process_time, frames_per_second))
+        # print("FPS: " + str(frames_per_second))
 
 
 def predict_age_local(np_image):
@@ -203,9 +220,12 @@ def predict_age_local(np_image):
 def update_trackers(image, bounding_boxes):
     tracker = cv2.MultiTracker_create()
     for box in bounding_boxes:
-        tracker.add(cv2.TrackerKCF_create(), image, tuple(box))
+        #tracker.add(cv2.TrackerKCF_create(), image, tuple(box))
+        # Use MedianFlow tracker because it is fastest
+        tracker.add(cv2.TrackerMedianFlow_create(), image, tuple(box))
     return tracker
 
 
 if __name__ == "__main__":
     socketio.run(app, host='0.0.0.0', port=7000)
+
