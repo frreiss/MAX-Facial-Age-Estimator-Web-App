@@ -73,7 +73,7 @@ def convert_to_JPEG(np_image_frame):
     # np_image_color = cv2.cvtColor(np_image_frame, cv2.COLOR_BGR2RGB)
     image = Image.fromarray(np_image_frame)
     with BytesIO() as f:
-        image.save(f, format='JPEG')
+        image.save(f, format='JPEG', quality=95)
         return f.getvalue()
 
 
@@ -120,6 +120,13 @@ def gen():
     executor = ThreadPoolExecutor(max_workers=1)
     future = None
 
+    # The image submitted for the most recent inference request
+    last_inference_image = None
+    
+    # List of images captured since the last time an image was submitted to
+    # the expensive backend model.
+    images_since_submit = []
+
     while True:
         start = time.time()
         try:
@@ -133,19 +140,31 @@ def gen():
                                   (IMAGE_RESOLUTION, int(IMAGE_RESOLUTION*img_h/img_w)))
         img_h, img_w, _ = np.shape(img_np_frame)
 
-        if future is None:
-            future = executor.submit(predict_age_local, img_np_frame)
-
-        if future.done():
+        # Start by handling any outstanding results from previous model
+        # invocations.
+        if future is not None and future.done():
             predict_results = future.result()
             bounding_boxes = [entry['face_box'] for entry in predict_results]
             age_results = [entry['age_estimation'] for entry in predict_results]
-            tracker = update_trackers(img_np_frame, bounding_boxes)
-            color = (0, 0, 255)       # Alternate color to differentiate b/w model or tracker boxes
-            future = executor.submit(predict_age_local, img_np_frame)
+            tracker = update_trackers(last_inference_image, bounding_boxes)
 
+            # Play back the video that has happened since the image was
+            # submitted for inference, updating the bounding boxes as we go
+            for img in images_since_submit:
+                tracker.update(img)
+
+            # Use a different color to indicate updated bounding box
+            color = (0, 0, 255)
         else:
             color = (255, 255, 0)
+
+        # Start a new inference request if it is appropriate to do so.
+        if future is None or future.done():
+            future = executor.submit(predict_age_local, img_np_frame)
+            last_inference_image = img_np_frame
+            images_since_submit.clear()
+        else:
+            images_since_submit.append(img_np_frame)
 
         # Use CV2 MultiTracker to track faces and pair ages to face
         success, bounding_boxes = tracker.update(img_np_frame)
