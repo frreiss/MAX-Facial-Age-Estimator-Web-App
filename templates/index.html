@@ -44,17 +44,20 @@ limitations under the License.
                     <h1>MAX Facial Age Estimator</h1>
                     <button id="webcame" class="btn btn-primary select-buttons">Enable Webcam</button>
                 </div>
-
-                <div class="col-md-4">
-                    <video style="display:none" autoplay></video>
-                    <img src="{{ url_for('video_feed') }}" width="711" height="400">
-                </div>
+            </div>
+        </div>
+        <div class="row">
+            <div class="col-md-4">
+                <video style="display:none" autoplay></video>
+                <img src="{{ url_for('video_feed') }}" width="1024" height="576">
             </div>
         </div>
 
+
         <footer class="footer">
             <hr/>
-            <p style="float:left">Created at the IBM Center for Open-Source Data & AI Technologies</p>
+            <p style="float:left">Created at the IBM Center for Open-Source
+            Data and AI Technologies</p>
             <p style="float:right">
                 Source code available on
                 <a href="https://github.com/ihjhuo/MAX-Age-Estimation-Web-App" target="_blank">GitHub</a>
@@ -62,7 +65,12 @@ limitations under the License.
         </footer>
     </div>
 
-<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.0.3/socket.io.js"></script>
+<!-- This page used to download this JS file from a remote server; now we pull
+    a local copy
+<script type="text/javascript"
+    src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.0.3/socket.io.js"></script>
+-->
+<script type="text/javascript" src="{{ url_for('static', filename='js/socket.io.js') }}"></script>
 <script src="{{ url_for('static', filename='js/webapp_video.js') }}?6.44"></script>
 <script src="http://ajax.googleapis.com/ajax/libs/chrome-frame/1/CFInstall.min.js"></script>
 <script>CFInstall.check({mode: 'overlay'});</script>

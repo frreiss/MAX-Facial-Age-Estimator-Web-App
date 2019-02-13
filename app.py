@@ -14,15 +14,15 @@
 # limitations under the License.
 #
 
-import time
-from concurrent.futures import ThreadPoolExecutor
-
-import queue
 import base64
+import cv2
+import json
 import numpy as np
 import requests
-import json
-import cv2
+import threading
+import time
+
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, Response
 from gevent import monkey
 from io import BytesIO
@@ -32,13 +32,211 @@ try:
 except ImportError:
     from flask_socketio import SocketIO, emit
 
+################################################################################
+# GLOBALS
 
 monkey.patch_all()
 app = Flask(__name__)
 app.config.from_object('config')
-app.queue = queue.Queue(1)  # Keep queue size low to avoid video frame lag
+
+# Condition variable for passing incoming frames to the video processing thread
+app.condition_var = threading.Condition()
+
+# Zero or one-element list holding the most recent video frame, if available
+# Guarded by app.condition_var
+app.latest_frame_list = []
+
+app.start_time = time.time()
+
 socketio = SocketIO(app)
 
+
+################################################################################
+# HANDLERS
+
+@app.route("/")
+def index():
+    """Video streaming home page."""
+    return render_template('index.html')
+
+
+@socketio.on('netin', namespace='/streaming')
+def msg(dta):
+    emit('response', {'data': dta['data']})
+
+
+@socketio.on('connected', namespace='/streaming')
+def connected():
+    emit('response', {'data': 'OK'})
+
+
+@socketio.on('streamingvideo', namespace='/streaming')
+def webdata(dta):
+    print("{:5.3f} Image received".format(time.time() - app.start_time))
+    with app.condition_var:
+        # Clear stale frames. In the future we may retain some of these frames
+        # to aid in object tracking.
+        app.latest_frame_list.clear()
+        app.latest_frame_list.append(dta['data'])
+        app.condition_var.notify()
+
+
+@app.route('/video_feed')
+def video_feed():
+    """Video streaming route. Put this in the src attribute of an img tag."""
+    return Response(gen(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+################################################################################
+# MAIN LOOP
+
+def gen():
+    # FPS now regulated in client.
+    # TARGET_FPS = 30.0
+    # FRAME_TIME_INTERVAL = 1.0 / TARGET_FPS
+
+    # Width of the images we send to the expensive model for inference
+    INFERENCE_IMAGE_WIDTH_PX = 1024
+
+    # Width of the images we use for local object tracking
+    TRACKING_IMAGE_WIDTH_PX = 256
+
+    # Width of the images we send back to the browser
+    DISPLAY_IMAGE_WIDTH_PX = 1024
+
+    # If True, skip all the machine learning stuff to help debug end-to-end
+    # latency issues.
+    SKIP_INFERENCE = False
+
+    # Factor to use for exponentially decaying averages.
+    # 0.0 => ignore new values, 1.0 => ignore old values
+    EXP_DECAY_FACTOR = 0.1
+
+    frames_since_update = 0
+
+    tracker = cv2.MultiTracker_create()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = None
+
+    # The image submitted for the most recent inference request, downsampled
+    # to a width of TRACKING_IMAGE_WIDTH_PX pixels
+    last_inference_image = None
+
+    # List of images captured since the last time an image was submitted to
+    # the expensive backend model. Image size determined by
+    # TRACKING_IMAGE_WIDTH_PX.
+    images_since_submit = []
+
+    # Bounding boxes of faces in the most recent frame, relative to
+    # TRACKING_IMAGE_WIDTH_PX.
+    bounding_boxes = []
+
+    # Age estimates corresponding to the bounding boxes.
+    # When more than one age has been received, these are exponentially
+    # decaying averages
+    age_results = []
+
+    # Timestamp of the most recent frame processed
+    frame_ts = 0.
+
+    while True:
+        with app.condition_var:
+            # Wait for the browser to send an image
+            while len(app.latest_frame_list) == 0:
+                app.condition_var.wait()
+            img_data = app.latest_frame_list.pop()
+
+        last_frame_ts = frame_ts
+        frame_ts = time.time()
+        print("{:5.3f}      ==> Image dequeued ({:4.1f} FPS)"
+              "".format(time.time() - app.start_time,
+                        1.0 / (frame_ts - last_frame_ts)))
+
+        input_img = base64_to_pil_image(img_data.split('base64')[-1])
+        raw_img_np_frame = np.array(input_img)
+
+        # Mirror effect
+        raw_img_np_frame = cv2.flip(raw_img_np_frame, 1)
+
+        if SKIP_INFERENCE:
+            print("{:5.3f}            ==> Image sent"
+                  "".format(time.time() - app.start_time))
+            yield(gen_result_bytes(raw_img_np_frame))
+            # regulate_fps(start, FRAME_TIME_INTERVAL)
+            continue
+
+        # Create versions of the image at different sizes for different
+        # purposes.
+        inference_np_frame = resize_image(raw_img_np_frame, INFERENCE_IMAGE_WIDTH_PX)
+        tracking_np_frame = resize_image(raw_img_np_frame, TRACKING_IMAGE_WIDTH_PX)
+        display_np_frame = resize_image(raw_img_np_frame, DISPLAY_IMAGE_WIDTH_PX)
+
+        # Start by handling any outstanding results from previous model
+        # invocations.
+        if future is not None and future.done():
+            # Remember the previous results so we can connect them with the
+            # new results.
+            last_inference_image_bounding_boxes = bounding_boxes
+            last_inference_image_ages = age_results
+
+            predict_results = future.result()
+            bounding_boxes = [entry['face_box'] for entry in predict_results]
+            age_results = [entry['age_estimation'] for entry in predict_results]
+
+            # Scale the bounding boxes to the image size we use for tracking.
+            bounding_boxes = scale_bounding_boxes(bounding_boxes,
+                                                  INFERENCE_IMAGE_WIDTH_PX,
+                                                  TRACKING_IMAGE_WIDTH_PX)
+            tracker = update_trackers(last_inference_image, bounding_boxes)
+
+            # Play back the video that has happened since the image was
+            # submitted for inference, updating the bounding boxes as we go
+            for img in images_since_submit:
+                _, _ = tracker.update(img)
+
+            # Match faces from the previous match with the current match
+            bbox_mapping = match_bounding_boxes(last_inference_image_bounding_boxes,
+                                                bounding_boxes)
+
+            for old_ix, new_ix in bbox_mapping:
+                old_age = last_inference_image_ages[old_ix]
+                new_age = age_results[new_ix]
+                exp_decay_average_age = (new_age * EXP_DECAY_FACTOR
+                                         + old_age * (1.0 - EXP_DECAY_FACTOR))
+                age_results[new_ix] = exp_decay_average_age
+
+            frames_since_update = 0
+        else:
+            frames_since_update += 1
+
+        # Start a new inference request if it is appropriate to do so.
+        if future is None or future.done():
+            future = executor.submit(predict_age_local, inference_np_frame)
+            last_inference_image = tracking_np_frame
+            images_since_submit.clear()
+        else:
+            images_since_submit.append(tracking_np_frame)
+
+        # Use CV2 MultiTracker to track faces and pair ages to face
+        # For now, every box gets the same color.
+        color_tuple = box_color(frames_since_update)
+        success, bounding_boxes = tracker.update(tracking_np_frame)
+        scaled_bounding_boxes = scale_bounding_boxes(bounding_boxes,
+                                                     TRACKING_IMAGE_WIDTH_PX,
+                                                     DISPLAY_IMAGE_WIDTH_PX)
+        for i, (box, age) in enumerate(zip(scaled_bounding_boxes, age_results)):
+            display_np_frame = draw_boxes_and_label(display_np_frame, str(int(age)),
+                                                    box, color_tuple)
+
+        print("{:5.3f}                ==> Annotated image sent"
+              "".format(time.time() - app.start_time))
+        yield(gen_result_bytes(display_np_frame))
+        # regulate_fps(start, FRAME_TIME_INTERVAL)
+
+
+################################################################################
+# SUBROUTINES
 
 def box_color(frames_since_update):
     """
@@ -112,144 +310,53 @@ def convert_to_JPEG(np_image_frame):
         return f.getvalue()
 
 
-@app.route("/")
-def index():
-    """Video streaming home page."""
-    return render_template('index.html')
+def resize_image(img_np, target_width_px):
+    """
+    Subroutine to resize an image using OpenCV.
+
+    Args:
+        img_np: Numpy array containing image pixels
+        target_width_px: Target width for the image, in pixels.
+            Image height will be scaled byt he same factor.
+
+    Returns:
+        resized image as a numpy array
+    """
+    img_h, img_w, _ = img_np.shape
+    if img_w == target_width_px:
+        return img_np  # Resize not necessary
+    else:
+        return cv2.resize(img_np, (target_width_px,
+                                   int(target_width_px * img_h / img_w)))
 
 
-@socketio.on('netin', namespace='/streaming')
-def msg(dta):
-    emit('response', {'data': dta['data']})
+def gen_result_bytes(np_frame):
+    # draw_FPS(display_np_frame, frames_per_second)
+    result_image = convert_to_JPEG(np_frame)
+
+    return (b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n' + result_image + b'\r\n')
 
 
-@socketio.on('connected', namespace='/streaming')
-def connected():
-    emit('response', {'data': 'OK'})
+def regulate_fps(start_time, frame_time_interval):
+    """
+    CURRENTLY UNUSED.
 
+    Delay processing to meet a target loop time.  Call this at the
+    end of a tight loop.
 
-@socketio.on('streamingvideo', namespace='/streaming')
-def webdata(dta):
-    try:
-        app.queue.put_nowait(dta['data'])
-    except queue.Full:
-        pass
+    Args:
+        start_time: Time that the current iteration started
+        frame_time_interval: Target loop time
+    """
+    loop_process_time = time.time() - start_time
+    if loop_process_time < frame_time_interval:
+        time.sleep(frame_time_interval - loop_process_time)
 
-
-@app.route('/video_feed')
-def video_feed():
-    """Video streaming route. Put this in the src attribute of an img tag."""
-    return Response(gen(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-def gen():
-    TARGET_FPS = 20.0
-    FRAME_TIME_INTERVAL = 1.0 / TARGET_FPS
-    IMAGE_WIDTH_PX = 1024  # Width of image AFTER resizing
-
-    # Factor to use for exponentially decaying averages.
-    # 0.0 => ignore new values, 1.0 => ignore old values
-    EXP_DECAY_FACTOR = 0.1
-
-    frames_per_second = 0           # Stores FPS of last frame processed
-    frames_since_update = 0
-
-    tracker = cv2.MultiTracker_create()
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = None
-
-    # The image submitted for the most recent inference request
-    last_inference_image = None
-
-    # List of images captured since the last time an image was submitted to
-    # the expensive backend model.
-    images_since_submit = []
-
-    # Bounding boxes of faces in the most recent frame
-    bounding_boxes = []
-
-    # Age estimates corresponding to the bounding boxes.
-    # When more than one age has been received, these are exponentially
-    # decaying averages
-    age_results = []
-
-    while True:
-        start = time.time()
-        try:
-            input_img = base64_to_pil_image(app.queue.get_nowait().split('base64')[-1])
-        except queue.Empty:
-            input_img = base64_to_pil_image(app.queue.get().split('base64')[-1])
-
-        img_np_frame = np.array(input_img)
-        img_h, img_w, _ = np.shape(img_np_frame)
-        img_np_frame = cv2.resize(img_np_frame,
-                                  (IMAGE_WIDTH_PX, int(IMAGE_WIDTH_PX*img_h/img_w)))
-        img_h, img_w, _ = np.shape(img_np_frame)
-
-        # Start by handling any outstanding results from previous model
-        # invocations.
-        if future is not None and future.done():
-            # Remember the previous results so we can connect them with the
-            # new results.
-            last_inference_image_bounding_boxes = bounding_boxes
-            last_inference_image_ages = age_results
-
-            predict_results = future.result()
-            bounding_boxes = [entry['face_box'] for entry in predict_results]
-            age_results = [entry['age_estimation'] for entry in predict_results]
-            tracker = update_trackers(last_inference_image, bounding_boxes)
-
-            # Play back the video that has happened since the image was
-            # submitted for inference, updating the bounding boxes as we go
-            for img in images_since_submit:
-                _, _ = tracker.update(img)
-
-            # Match faces from the previous match with the current match
-            bbox_mapping = match_bounding_boxes(last_inference_image_bounding_boxes,
-                                                bounding_boxes)
-
-            for old_ix, new_ix in bbox_mapping:
-                old_age = last_inference_image_ages[old_ix]
-                new_age = age_results[new_ix]
-                exp_decay_average_age = (new_age * EXP_DECAY_FACTOR
-                                         + old_age * (1.0 - EXP_DECAY_FACTOR))
-                age_results[new_ix] = exp_decay_average_age
-
-            frames_since_update = 0
-        else:
-            frames_since_update += 1
-
-        # Start a new inference request if it is appropriate to do so.
-        if future is None or future.done():
-            future = executor.submit(predict_age_local, img_np_frame)
-            last_inference_image = img_np_frame
-            images_since_submit.clear()
-        else:
-            images_since_submit.append(img_np_frame)
-
-        # Use CV2 MultiTracker to track faces and pair ages to face
-        # For now, every box gets the same color.
-        color_tuple = box_color(frames_since_update)
-        success, bounding_boxes = tracker.update(img_np_frame)
-        for i, (box, age) in enumerate(zip(bounding_boxes, age_results)):
-            img_np_frame = draw_boxes_and_label(img_np_frame, str(int(age)), box,
-                                                color_tuple)
-
-        # draw_FPS(img_np_frame, frames_per_second)
-        result_image = convert_to_JPEG(img_np_frame)
-
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + result_image + b'\r\n')
-
-        loop_process_time = time.time() - start
-        if loop_process_time < FRAME_TIME_INTERVAL:
-            time.sleep(FRAME_TIME_INTERVAL - loop_process_time)
-
-        actual_loop_time = time.time() - start
-        frames_per_second = 1.0 / actual_loop_time
-        print("Processing time {:4.3f} sec; FPS {:4.2f}"
-              "".format(loop_process_time, frames_per_second))
+    actual_loop_time = time.time() - start_time
+    frames_per_second = 1.0 / actual_loop_time
+    print("Processing time {:4.3f} sec; FPS {:4.2f}"
+          "".format(loop_process_time, frames_per_second))
 
 
 def predict_age_local(np_image):
@@ -276,6 +383,33 @@ def update_trackers(image, bounding_boxes):
         # fewer frames.
         tracker.add(cv2.TrackerMedianFlow_create(), image, tuple(box))
     return tracker
+
+
+def scale_bounding_boxes(bounding_boxes, orig_width, new_width):
+    """
+    Scale a list of bounding boxes to reflect a change in image size.
+
+    Args:
+        bounding_boxes: List of lists of [x1, y1, x2, y2], where
+            (x1, y1) is the upper left corner of the box, x2 is the width
+            of the box, and y2 is the height of the box.
+        orig_width: Width of the images to which bounding_boxes apply
+        new_width: Width of the target images to which the bounding boxes
+            should be translated
+    Returns:
+        A new list of bounding boxes with the appropriate scaling factor
+        applied.
+    """
+    scale_factor = new_width / orig_width
+    ret = []
+    # Use a for loop because OpenCV doesn't play well with generators
+    for bbox in bounding_boxes:
+        new_bbox = []
+        for elem in bbox:
+            new_elem = round(float(elem) * scale_factor)
+            new_bbox.append(new_elem)
+        ret.append(new_bbox)
+    return ret
 
 
 def match_bounding_boxes(old_bounding_boxes, new_bounding_boxes):
@@ -342,5 +476,7 @@ def match_bounding_boxes(old_bounding_boxes, new_bounding_boxes):
     return ret
 
 
+################################################################################
+# main function
 if __name__ == "__main__":
     socketio.run(app, host='0.0.0.0', port=7000)
