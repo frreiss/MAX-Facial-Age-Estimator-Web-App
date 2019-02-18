@@ -42,10 +42,12 @@ app.config.from_object('config')
 # Condition variable for passing incoming frames to the video processing thread
 app.condition_var = threading.Condition()
 
-# Zero or one-element list holding the most recent video frame, if available
-# Guarded by app.condition_var
+# Zero or one-element list holding the most recent video frame, if available.
+# Guarded by app.condition_var.
 app.latest_frame_list = []
 
+# Time that the most recent iteration of the main image processing loop began.
+# Used for calculating and printing FPS and latency.
 app.start_time = time.time()
 
 socketio = SocketIO(app)
@@ -113,6 +115,8 @@ def gen():
     # 0.0 => ignore new values, 1.0 => ignore old values
     EXP_DECAY_FACTOR = 0.1
 
+    # Number of frames since the last time the expensive model was run. Used
+    # for choosing box color.
     frames_since_update = 0
 
     tracker = cv2.MultiTracker_create()
@@ -214,7 +218,7 @@ def gen():
         if future is None or future.done():
             future = executor.submit(predict_age_local, inference_np_frame)
             last_inference_image = tracking_np_frame
-            images_since_submit.clear()
+            del images_since_submit[:]
         else:
             images_since_submit.append(tracking_np_frame)
 
@@ -333,7 +337,6 @@ def resize_image(img_np, target_width_px):
 def gen_result_bytes(np_frame):
     # draw_FPS(display_np_frame, frames_per_second)
     result_image = convert_to_JPEG(np_frame)
-
     return (b'--frame\r\n'
             b'Content-Type: image/jpeg\r\n\r\n' + result_image + b'\r\n')
 

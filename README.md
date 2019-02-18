@@ -178,7 +178,7 @@ Build the web app image by running:
 
 Run the web app container using:
 
-    docker run -it --net='container:max-facial-age-estimator' max-age-estimation-web-app
+    docker run -it --net='container:max-facial-age-estimator' max-age-estimator-web-app
 
 ##### Using the Docker Hub Image
 

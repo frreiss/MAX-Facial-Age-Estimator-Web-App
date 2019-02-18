@@ -7,3 +7,4 @@ requests
 opencv-python
 flake8
 opencv-contrib-python
+futures
