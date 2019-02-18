@@ -70,9 +70,9 @@
   /** 
    * Compute how long to sleep until it's time to send the next frame. 
    * Uses the following global variables to adjust the delay:
-   *   -- lastFrameMsec
-   *   -- avgError
-   *   -- prevError
+   *   -- lastFrameMsec (timestamp of last frame)
+   *   -- integralError (integral of error, with exponential smoothing)
+   *   -- prevError (error in delay of previous frame)
    */
   function msecToNextFrame() {
     curMsec = Date.now()
@@ -83,7 +83,9 @@
     msecSinceLastFrame = curMsec - lastFrameMsec;
     lastFrameMsec = curMsec
 
-    // PID control
+    // PID control; see https://en.wikipedia.org/wiki/PID_controller
+    // Error is difference between target intra-frame delay and measured
+    // delay.
     curError = _FRAME_INTERVAL_MSEC - msecSinceLastFrame
     integralError = (integralError * _DECAY_FACTOR) 
         + (curError * (1.0 - _DECAY_FACTOR))
